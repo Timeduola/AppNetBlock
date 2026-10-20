@@ -1,0 +1,17 @@
+# 构建产物（发布请使用 GitHub Releases，不要提交二进制）
+dist/
+bin/
+obj/
+*.exe
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+
+# 系统杂项
+Thumbs.db
+Desktop.ini
+*.log

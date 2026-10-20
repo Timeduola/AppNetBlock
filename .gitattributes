@@ -1,0 +1,7 @@
+# 统一换行符处理
+* text=auto
+
+# 二进制文件
+*.png binary
+*.ico binary
+*.exe binary
