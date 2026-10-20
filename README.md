@@ -32,7 +32,7 @@ Windows 10 / 11 · 单文件 · 免安装 · 零依赖 · 零常驻
 
 ## 快速开始
 
-1. 从 [Releases](../../releases) 下载 `AppNetBlock.exe`，放入需要断网的软件 / 开心版软件目录（专治不开心）
+1. 从 [Releases](../../releases) 下载 `AppNetBlock.exe`，放入需要断网的软件目录 / 开心版软件目录（专治不开心）
 2. 双击运行，确认 UAC 弹窗
 3. 完成——该目录下所有 EXE 已断网
 
