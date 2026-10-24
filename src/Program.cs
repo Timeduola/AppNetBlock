@@ -4,10 +4,15 @@
 //  许可: MIT (详见仓库 LICENSE 文件)
 //
 //  原理: 将 Block 规则写入 Windows 防火墙(基于 WFP)的持久策略,
-//        对目标文件夹(含全部子文件夹)内每个 EXE 建立 入站+出站 双向阻止规则,
+//        对目标文件夹(含全部子文件夹)内每个可执行文件建立 入站+出站 双向阻止规则,
 //        并覆盖 域/专用/公用 全部网络配置文件。
 //        规则由系统防火墙服务直接执行: 重启电脑不失效, 切换网络不失效,
 //        无需任何后台常驻进程; Block 规则优先级高于系统内 Allow 规则。
+//
+//  默认覆盖的可执行格式: .exe / .com / .scr / .pif
+//  (均为可直接作为进程映像运行的 PE 格式, 防火墙按进程映像路径匹配, 可直接生效)
+//  可用 --ext 参数自定义扩展名; 注意 .bat/.cmd/.ps1 等脚本由解释器进程托管,
+//  防火墙规则匹配的是解释器映像而非脚本路径, 故默认不包含(强行加入也不会生效)。
 //
 //  兼容: Windows 10 / Windows 11 (依赖系统自带的 .NET Framework 4.x)
 //  权限: 需要管理员权限(程序清单已声明 requireAdministrator, 双击自动弹 UAC)
@@ -31,19 +36,19 @@ using System.Threading;
 // 供资源管理器"详细信息"页、任务管理器、UAC 弹窗显示(缺失则全部为空/0.0.0.0)。
 // 注意与常量 Version 保持同步。
 [assembly: AssemblyTitle("AppNetBlock 文件夹一键断网工具")]
-[assembly: AssemblyDescription("一键禁止文件夹(含全部子文件夹)内所有 EXE 的联网, 基于 Windows 防火墙持久规则")]
+[assembly: AssemblyDescription("一键禁止文件夹(含全部子文件夹)内所有可执行文件的联网, 基于 Windows 防火墙持久规则")]
 [assembly: AssemblyCompany("AppNetBlock Contributors")]
 [assembly: AssemblyProduct("AppNetBlock")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 AppNetBlock Contributors (MIT License)")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
-[assembly: AssemblyInformationalVersion("1.0.1")]
-[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyInformationalVersion("1.1.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
 
 namespace AppNetBlock
 {
     static class Program
     {
-        const string Version = "1.0.1";
+        const string Version = "1.1.0";
 
         // 组名(Grouping)前缀: 用于识别本工具创建的规则, 并按目录分组管理
         const string GroupPrefix = "AppNetBlock::";
@@ -55,6 +60,13 @@ namespace AppNetBlock
         const int NET_FW_RULE_DIR_OUT = 2;           // 出站
         const int NET_FW_PROFILE2_ALL = 0x7FFFFFFF;  // 全部配置文件(域/专用/公用)
 
+        // 默认扫描的可执行文件扩展名。
+        // 仅收录可直接作为进程映像运行的 PE 格式: 防火墙规则按"进程映像完整路径"匹配,
+        // 这类文件(如 .scr 屏幕保护、.com、.pif)启动后即为自身进程, 规则可直接生效。
+        // .bat/.cmd/.ps1/.vbs 等脚本由 cmd/PowerShell/wscript 等解释器进程托管,
+        // 规则匹配到的将是解释器映像而非脚本路径, 故不纳入默认列表。
+        static readonly string[] DefaultExtensions = { ".exe", ".com", ".scr", ".pif" };
+
         // STAThread: hnetcfg 防火墙 COM 组件为 Apartment 线程模型,
         // 主线程必须为 STA, 否则 Rules.Add(对象参数) 会因跨套间封送失败而报错。
         [STAThread]
@@ -62,6 +74,7 @@ namespace AppNetBlock
         {
             bool unblock = false, list = false, all = false, help = false, fwon = false;
             string target = null;
+            string extArg = null;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -70,11 +83,14 @@ namespace AppNetBlock
                 else if (Eq(a, "--fw-on")) fwon = true;
                 else if (a == "-l" || Eq(a, "--list")) list = true;
                 else if (a == "-a" || Eq(a, "--all")) all = true;
+                else if (Eq(a, "--ext") && i + 1 < args.Length) extArg = args[++i];
                 else if (a == "-h" || Eq(a, "--help") || a == "/?") help = true;
                 else if ((a == "-p" || Eq(a, "--path")) && i + 1 < args.Length) target = args[++i];
                 else { Console.WriteLine("未知参数: " + a); Console.WriteLine(); help = true; }
             }
             if (help) { PrintHelp(); return 0; }
+
+            string[] extensions = ParseExtensions(extArg);
 
             if (!IsAdmin())
             {
@@ -89,7 +105,7 @@ namespace AppNetBlock
                 if (fwon) return DoFirewallOn();
                 if (list) return DoList();
                 if (unblock) return DoUnblock(target, all);
-                return DoBlock(target);
+                return DoBlock(target, extensions);
             }
             catch (Exception ex)
             {
@@ -105,9 +121,24 @@ namespace AppNetBlock
             return string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
         }
 
+        // 解析 --ext 参数: "exe,com" / ".exe;.scr" 等写法均兼容; 无参数时返回默认列表
+        static string[] ParseExtensions(string extArg)
+        {
+            if (string.IsNullOrWhiteSpace(extArg)) return DefaultExtensions;
+            var set = new List<string>();
+            foreach (string part in extArg.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string e = part.Trim().TrimStart('.').ToLowerInvariant();
+                if (e.Length == 0) continue;
+                if (!set.Contains("." + e)) set.Add("." + e);
+            }
+            if (set.Count == 0) return DefaultExtensions;
+            return set.ToArray();
+        }
+
         // ------------------------------------------------------------------ 禁止联网
 
-        static int DoBlock(string target)
+        static int DoBlock(string target, string[] extensions)
         {
             string dir = ResolveTargetDir(target);
             string group = GroupPrefix + dir;
@@ -116,16 +147,17 @@ namespace AppNetBlock
             Console.WriteLine(" AppNetBlock v" + Version + "  -  文件夹一键断网 (基于 Windows 防火墙持久规则)");
             Console.WriteLine("==============================================================");
             Console.WriteLine("目标目录: " + dir);
-            Console.WriteLine("动作    : 禁止该目录(含全部子目录)内所有 EXE 的联网(入站+出站)");
+            Console.WriteLine("动作    : 禁止该目录(含全部子目录)内所有可执行文件的联网(入站+出站)");
+            Console.WriteLine("扩展名  : " + string.Join(" ", extensions));
             Console.WriteLine();
 
             if (!EnsureFirewallReady()) { Pause(); return 1; }
 
-            Console.WriteLine("正在扫描 EXE 文件, 请稍候...");
-            List<string> exes = FindAllExes(dir);
+            Console.WriteLine("正在扫描可执行文件, 请稍候...");
+            List<string> exes = FindAllExecutables(dir, extensions);
             if (exes.Count == 0)
             {
-                Console.WriteLine("[提示] 该目录下没有找到任何 .exe 文件, 无需处理。");
+                Console.WriteLine("[提示] 该目录下没有找到匹配 " + string.Join(" ", extensions) + " 的可执行文件, 无需处理。");
                 Pause();
                 return 0;
             }
@@ -167,12 +199,12 @@ namespace AppNetBlock
 
             Console.WriteLine();
             Console.WriteLine("--------------------------------------------------------------");
-            Console.WriteLine("完成: 共扫描 " + exes.Count + " 个 EXE, 本次禁止 " + blocked +
+            Console.WriteLine("完成: 共扫描 " + exes.Count + " 个可执行文件, 本次禁止 " + blocked +
                               " 个, 已存在跳过 " + skipped + " 个" +
                               (failed > 0 ? ", 失败 " + failed + " 个" : "") + "。");
             if (blocked > 0)
             {
-                Console.WriteLine("已为每个 EXE 建立 入站+出站 双向阻止规则, 覆盖 域/专用/公用 全部网络配置。");
+                Console.WriteLine("已为每个可执行文件建立 入站+出站 双向阻止规则, 覆盖 域/专用/公用 全部网络配置。");
                 Console.WriteLine("规则保存在 Windows 防火墙系统策略中: 重启电脑不失效, 切换网络不失效。");
                 Console.WriteLine("恢复联网: 运行 AppNetBlock.exe -u  (指定目录加 -p \"目录\")");
             }
@@ -200,7 +232,7 @@ namespace AppNetBlock
                 string dir = ResolveTargetDir(target);
                 string group = GroupPrefix + dir;
                 Console.WriteLine("目标目录: " + dir);
-                Console.WriteLine("动作    : 恢复该目录下所有 EXE 的联网");
+                Console.WriteLine("动作    : 恢复该目录下所有可执行文件的联网");
                 mine = allRules.Where(r => r.Group != null && Eq(r.Group, group)).ToList();
             }
 
@@ -246,7 +278,7 @@ namespace AppNetBlock
                 string dir = g.Key.Substring(GroupPrefix.Length);
                 int appCount = g.Select(r => r.App).Distinct(StringComparer.OrdinalIgnoreCase).Count();
                 Console.WriteLine();
-                Console.WriteLine("目录: " + dir + "   [断网 EXE " + appCount + " 个 / 规则 " + g.Count() + " 条]");
+                Console.WriteLine("目录: " + dir + "   [断网程序 " + appCount + " 个 / 规则 " + g.Count() + " 条]");
                 foreach (RuleInfo r in g.OrderBy(x => x.App).ThenBy(x => x.Direction))
                 {
                     Console.WriteLine("    [" + (r.Direction == NET_FW_RULE_DIR_IN ? "入站" : "出站") + "] " +
@@ -612,10 +644,14 @@ namespace AppNetBlock
 
         // ------------------------------------------------------------------ 文件扫描
 
-        // 递归枚举 root 及其全部子目录中的 .exe (跳过无权限目录; visited 防止符号链接循环)
-        static List<string> FindAllExes(string root)
+        // 递归枚举 root 及其全部子目录中匹配 extensions 的文件
+        // (跳过无权限目录; visited 防止符号链接循环; 哈希集合去重, 兼容 8.3 短文件名干扰)
+        static List<string> FindAllExecutables(string root, string[] extensions)
         {
             var result = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var extSet = new HashSet<string>(extensions, StringComparer.OrdinalIgnoreCase);
+            var patterns = extensions.Select(e => "*" + e).ToArray();
             var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var stack = new Stack<string>();
             stack.Push(root);
@@ -626,12 +662,17 @@ namespace AppNetBlock
                 string key = d.TrimEnd('\\').ToLowerInvariant();
                 if (!visited.Add(key)) continue;
 
-                string[] files;
-                try { files = Directory.GetFiles(d, "*.exe"); }
-                catch { files = new string[0]; }
-                foreach (string f in files)
+                foreach (string pattern in patterns)
                 {
-                    if (f.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) result.Add(f);
+                    string[] files;
+                    try { files = Directory.GetFiles(d, pattern); }
+                    catch { files = new string[0]; }
+                    foreach (string f in files)
+                    {
+                        // 严格按扩展名过滤(避免 GetFiles 通配符因短文件名产生误匹配)
+                        string ext = Path.GetExtension(f);
+                        if (extSet.Contains(ext) && seen.Add(f)) result.Add(f);
+                    }
                 }
 
                 string[] subdirs;
@@ -740,8 +781,9 @@ namespace AppNetBlock
             Console.WriteLine("AppNetBlock v" + Version + " - 文件夹一键断网工具 (基于 Windows 防火墙持久规则)");
             Console.WriteLine();
             Console.WriteLine("用法:");
-            Console.WriteLine("  AppNetBlock.exe                    禁止本程序所在文件夹(含子文件夹)内所有 EXE 联网");
-            Console.WriteLine("  AppNetBlock.exe -p \"D:\\目录\"       禁止指定目录(含子文件夹)内所有 EXE 联网");
+            Console.WriteLine("  AppNetBlock.exe                    禁止本程序所在文件夹(含子文件夹)内所有可执行文件联网");
+            Console.WriteLine("  AppNetBlock.exe -p \"D:\\目录\"       禁止指定目录(含子文件夹)内所有可执行文件联网");
+            Console.WriteLine("  AppNetBlock.exe --ext exe,com      自定义要扫描的扩展名(默认 exe com scr pif)");
             Console.WriteLine("  AppNetBlock.exe -u                 恢复本程序所在文件夹的联网");
             Console.WriteLine("  AppNetBlock.exe -u -p \"D:\\目录\"    恢复指定目录的联网");
             Console.WriteLine("  AppNetBlock.exe -u -a              恢复本工具管理过的所有目录的联网");
@@ -750,7 +792,9 @@ namespace AppNetBlock
             Console.WriteLine("  AppNetBlock.exe -h                 显示本帮助");
             Console.WriteLine();
             Console.WriteLine("特性:");
-            Console.WriteLine("  - 一键对文件夹(含全部子文件夹)内所有 EXE 建立 入站+出站 双向阻止规则");
+            Console.WriteLine("  - 一键对文件夹(含全部子文件夹)内所有可执行文件建立 入站+出站 双向阻止规则");
+            Console.WriteLine("  - 默认覆盖 .exe / .com / .scr / .pif 四种可直接作为进程运行的可执行格式");
+            Console.WriteLine("  - 可用 --ext 自定义扩展名, 如: AppNetBlock.exe --ext exe,com,scr");
             Console.WriteLine("  - 规则覆盖 域/专用/公用 全部网络配置文件, 切换 Wi-Fi/有线/热点均有效");
             Console.WriteLine("  - 规则保存在 Windows 防火墙系统策略中, 重启电脑不失效, 无需后台常驻进程");
             Console.WriteLine("  - Block 规则优先级高于系统内其他 Allow 规则");
@@ -759,6 +803,8 @@ namespace AppNetBlock
             Console.WriteLine();
             Console.WriteLine("注意:");
             Console.WriteLine("  - 需要管理员权限(程序清单已声明, 双击自动弹出 UAC)");
+            Console.WriteLine("  - .bat/.cmd/.ps1/.vbs 等脚本由解释器进程托管, 防火墙按进程映像路径匹配,");
+            Console.WriteLine("    阻断脚本路径本身不生效; 将其加入 --ext 不会带来断网效果");
             Console.WriteLine("  - 若程序文件移动了位置, 规则不再匹配, 需在新位置重新运行一次");
             Console.WriteLine("  - 兼容 Windows 10 / Windows 11 (依赖系统自带 .NET Framework 4.x)");
             Console.WriteLine("  - 也可用 PowerShell 管理: Get-NetFirewallRule -Group \"AppNetBlock::*\"");
